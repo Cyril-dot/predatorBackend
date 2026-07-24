@@ -35,6 +35,14 @@ public class AdminAuthFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
+        // Never intercept CORS preflight - it carries no Authorization header
+        // by design. The dedicated CorsFilter (see WebConfig) already runs
+        // before this filter and handles preflight, but this check is kept
+        // as defense-in-depth in case filter ordering ever changes.
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            return true;
+        }
+
         String uri = request.getRequestURI();
         // Auth endpoints (login/logout) for both admin and super admin must
         // stay open - login is how you get a token in the first place, and

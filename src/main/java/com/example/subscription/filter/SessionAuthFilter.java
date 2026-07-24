@@ -30,6 +30,13 @@ public class SessionAuthFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
+        // Never intercept CORS preflight - it carries no Authorization header
+        // by design. The dedicated CorsFilter (see WebConfig) already runs
+        // before this filter and handles preflight, but this check is kept
+        // as defense-in-depth in case filter ordering ever changes.
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            return true;
+        }
         return !request.getRequestURI().startsWith("/api/protected");
     }
 
