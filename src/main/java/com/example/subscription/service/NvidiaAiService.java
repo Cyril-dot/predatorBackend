@@ -5,6 +5,8 @@ import com.example.subscription.model.PickPrediction;
 import com.example.subscription.model.ScanPlan;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -16,6 +18,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Calls an NVIDIA-hosted, OpenAI-compatible chat completions endpoint
@@ -31,12 +35,21 @@ import java.util.Map;
  * Non-streaming is used here (stream=false) since the backend needs the
  * complete answer before it can parse it into structured picks and hand it
  * back to the controller in one response.
+ *
+ * MODEL FALLBACK: each attempt against a given model gets a short timeout
+ * (nvidia.attempt-timeout-seconds, default 5s). If a model doesn't respond
+ * within that window (or errors out), the service automatically moves on to
+ * the next model in the chain (primary model + up to 4 fallback models
+ * configured via nvidia.fallback-models). The first model that returns
+ * successfully wins; if every model in the chain fails, an ApiException is
+ * thrown.
  */
 @Service
 public class NvidiaAiService {
 
+    private static final Logger log = LoggerFactory.getLogger(NvidiaAiService.class);
+
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final Duration timeout = Duration.ofSeconds(75);
 
     @Value("${nvidia.api-key:}")
     private String apiKey;
@@ -46,6 +59,22 @@ public class NvidiaAiService {
 
     @Value("${nvidia.model:nvidia/nemotron-3-ultra-550b-a55b}")
     private String model;
+
+    /**
+     * Comma-separated list of fallback vision-capable models, tried in order
+     * if the primary model times out or errors. Defaults to 4 fallbacks.
+     */
+    @Value("${nvidia.fallback-models:" +
+            "meta/llama-3.2-90b-vision-instruct," +
+            "meta/llama-3.2-11b-vision-instruct," +
+            "microsoft/phi-3.5-vision-instruct," +
+            "google/gemma-3-27b-it" +
+            "}")
+    private String fallbackModelsRaw;
+
+    /** Per-attempt timeout: how long we wait on a single model before failing over. */
+    @Value("${nvidia.attempt-timeout-seconds:5}")
+    private long attemptTimeoutSeconds;
 
     private final WebClient.Builder webClientBuilder;
 
@@ -57,6 +86,7 @@ public class NvidiaAiService {
         public int totalPicksDetected;
         public List<PickPrediction> predictions = new ArrayList<>();
         public String rawModelOutput; // populated only if JSON parsing failed
+        public String modelUsed;      // which model in the chain actually answered
     }
 
     /**
@@ -164,16 +194,57 @@ public class NvidiaAiService {
                 Always return valid JSON that can be parsed directly by a JSON parser.
                 """
         );
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", model);
-        body.put("messages", List.of(systemMessage, userMessage));
-        body.put("temperature", 0.4);
-        body.put("top_p", 0.9);
-        body.put("max_tokens", 4096);
-        body.put("stream", false);
 
-        String content = callChatCompletions(body);
-        return parseModelResponse(content, plan);
+        Map<String, Object> baseBody = new LinkedHashMap<>();
+        baseBody.put("messages", List.of(systemMessage, userMessage));
+        baseBody.put("temperature", 0.4);
+        baseBody.put("top_p", 0.9);
+        baseBody.put("max_tokens", 4096);
+        baseBody.put("stream", false);
+
+        List<String> modelChain = buildModelChain();
+
+        Exception lastError = null;
+        for (String candidateModel : modelChain) {
+            try {
+                Map<String, Object> body = new LinkedHashMap<>(baseBody);
+                body.put("model", candidateModel);
+
+                log.info("Attempting slip scan with model [{}] (timeout {}s)", candidateModel, attemptTimeoutSeconds);
+                String content = callChatCompletions(body, candidateModel);
+
+                ScanAnalysis analysis = parseModelResponse(content, plan);
+                analysis.modelUsed = candidateModel;
+                return analysis;
+            } catch (Exception ex) {
+                lastError = ex;
+                log.warn("Model [{}] failed or timed out after {}s, falling back to next model. Reason: {}",
+                        candidateModel, attemptTimeoutSeconds, ex.getMessage());
+            }
+        }
+
+        // Every model in the chain failed.
+        String message = "AI scanning failed: all " + modelChain.size() +
+                " model(s) in the fallback chain timed out or errored" +
+                (lastError != null ? (" (last error: " + lastError.getMessage() + ")") : "");
+        throw new ApiException(message, HttpStatus.BAD_GATEWAY);
+    }
+
+    /** Builds the ordered list of models to try: primary model first, then up to 4 configured fallbacks. */
+    private List<String> buildModelChain() {
+        List<String> chain = new ArrayList<>();
+        chain.add(model);
+
+        if (fallbackModelsRaw != null && !fallbackModelsRaw.isBlank()) {
+            List<String> fallbacks = Stream.of(fallbackModelsRaw.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .filter(s -> !s.equals(model)) // avoid retrying the same model twice in a row
+                    .collect(Collectors.toList());
+            chain.addAll(fallbacks);
+        }
+
+        return chain;
     }
 
     private String buildPrompt(ScanPlan plan) {
@@ -205,8 +276,16 @@ public class NvidiaAiService {
                 "}";
     }
 
+    /**
+     * Performs a single attempt against the given model. Uses a short
+     * per-attempt timeout (attemptTimeoutSeconds) and NO internal retries -
+     * on failure/timeout the caller (analyzeSlip) is responsible for moving
+     * on to the next model in the fallback chain.
+     */
     @SuppressWarnings("unchecked")
-    private String callChatCompletions(Map<String, Object> body) {
+    private String callChatCompletions(Map<String, Object> body, String candidateModel) {
+        Duration attemptTimeout = Duration.ofSeconds(attemptTimeoutSeconds);
+
         Map<String, Object> result;
         try {
             result = (Map<String, Object>) webClientBuilder.build()
@@ -216,26 +295,28 @@ public class NvidiaAiService {
                     .bodyValue(body)
                     .retrieve()
                     .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(respBody ->
-                            new ApiException("AI provider returned " + r.statusCode() + ": " + respBody,
-                                    HttpStatus.BAD_GATEWAY)))
+                            new ApiException("AI provider [" + candidateModel + "] returned " + r.statusCode() +
+                                    ": " + respBody, HttpStatus.BAD_GATEWAY)))
                     .bodyToMono(Map.class)
-                    .timeout(timeout)
-                    .retryWhen(Retry.max(1).filter(ex -> !(ex instanceof ApiException)))
+                    .timeout(attemptTimeout)
+                    .retryWhen(Retry.max(0)) // no retry on same model - fail fast so we can fall over
                     .onErrorMap(ex -> !(ex instanceof ApiException),
-                            ex -> new ApiException("Error contacting AI provider: " + ex.getMessage(),
-                                    HttpStatus.BAD_GATEWAY))
+                            ex -> new ApiException("Error contacting AI provider [" + candidateModel + "]: " +
+                                    ex.getMessage(), HttpStatus.BAD_GATEWAY))
                     .block();
         } catch (ApiException ex) {
             throw ex;
         }
 
         if (result == null) {
-            throw new ApiException("AI provider returned an empty response.", HttpStatus.BAD_GATEWAY);
+            throw new ApiException("AI provider [" + candidateModel + "] returned an empty response.",
+                    HttpStatus.BAD_GATEWAY);
         }
 
         List<Object> choices = (List<Object>) result.get("choices");
         if (choices == null || choices.isEmpty()) {
-            throw new ApiException("AI provider returned no choices.", HttpStatus.BAD_GATEWAY);
+            throw new ApiException("AI provider [" + candidateModel + "] returned no choices.",
+                    HttpStatus.BAD_GATEWAY);
         }
 
         Map<String, Object> firstChoice = (Map<String, Object>) choices.get(0);
@@ -243,7 +324,8 @@ public class NvidiaAiService {
         Object content = message != null ? message.get("content") : null;
 
         if (content == null) {
-            throw new ApiException("AI provider returned an empty message.", HttpStatus.BAD_GATEWAY);
+            throw new ApiException("AI provider [" + candidateModel + "] returned an empty message.",
+                    HttpStatus.BAD_GATEWAY);
         }
         return content.toString();
     }
