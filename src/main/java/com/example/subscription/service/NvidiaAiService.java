@@ -56,15 +56,26 @@ import java.util.stream.Stream;
  * date passes, drop them from ai.gemini.models (or this will start failing with
  * HTTP 404) and lean on gemini-3-flash / gemini-3.1-flash-lite instead.
  *
+ * GEMINI MULTI-KEY NOTE: you can now supply MULTIPLE Gemini API keys via
+ * ai.gemini.api-keys=key1,key2,key3 (comma-separated). Each key is expanded
+ * into its own Provider in the attempt chain, in the order given, each trying
+ * every model in ai.gemini.models before moving to the next key. This means a
+ * key that is rate-limited (429) or out of free-tier credits (402) fails over
+ * to the next Gemini key BEFORE the chain ever falls through to Cerebras.
+ * ai.gemini.api-key (singular) still works as a one-key shorthand and is used
+ * only if ai.gemini.api-keys is not set. The same ai.<id>.api-keys pattern
+ * works for any provider, not just gemini.
+ *
  * CEREBRAS NOTE: Cerebras Inference is an OpenAI-compatible endpoint too, but
  * vision (image input) is currently only supported by gemma-4-31b - it is the
  * only model in the default list. Free-tier accounts are capped at 2 images per
  * request, which is fine here since we only ever send one. Get a key at
- * https://cloud.cerebras.ai and set ai.cerebras.api-key.
+ * https://cloud.cerebras.ai and set ai.cerebras.api-key (or ai.cerebras.api-keys
+ * for multiple Cerebras keys, same pattern as Gemini).
  *
- * Providers whose API key is blank are SKIPPED, so you can deploy with only one
- * of the two keys set (though both is recommended so Cerebras can cover Gemini
- * outages/rate limits and vice versa).
+ * Providers whose API key(s) are blank are SKIPPED, so you can deploy with only
+ * one of the two keys set (though both is recommended so Cerebras can cover
+ * Gemini outages/rate limits and vice versa).
  *
  * LOGGING: every scan gets a short trace id (MDC key "scanId") that prefixes all
  * log lines for that request, so concurrent scans stay untangled in the log file.
@@ -186,8 +197,8 @@ public class NvidiaAiService {
                 log.error("No usable provider. Configured chain=[{}] but none had an API key.", providersRaw);
                 throw new ApiException(
                         "AI scanning is not configured: no provider in [" + providersRaw +
-                                "] has an API key set. Set ai.gemini.api-key (Gemini, primary) or " +
-                                "ai.cerebras.api-key (Cerebras, fallback).",
+                                "] has an API key set. Set ai.gemini.api-key / ai.gemini.api-keys (Gemini, " +
+                                "primary) or ai.cerebras.api-key / ai.cerebras.api-keys (Cerebras, fallback).",
                         HttpStatus.SERVICE_UNAVAILABLE);
             }
 
@@ -306,12 +317,30 @@ public class NvidiaAiService {
     // Provider / chain construction
     // ------------------------------------------------------------------
 
+    /**
+     * Builds the full ordered list of attempts.
+     *
+     * For each provider id in ai.providers (default "gemini,cerebras"):
+     *   1. Resolve its base URL and model list (falling back to the built-in
+     *      defaults in defaultBaseUrl()/defaultModels() if not configured).
+     *   2. Resolve its API key(s):
+     *        - ai.<id>.api-keys  (comma-separated, preferred - supports N keys)
+     *        - ai.<id>.api-key   (single key, used only if api-keys is blank)
+     *   3. Expand into one Provider PER KEY, each carrying the SAME model list.
+     *      Provider ids become "<id>-key1", "<id>-key2", ... when there is more
+     *      than one key, so the attempt-chain log and the summary table make it
+     *      obvious which key answered (or failed) without ever printing the key
+     *      itself - see mask().
+     *   4. Flatten every (key x model) pair into the attempt chain, in order:
+     *      all models for key 1, then all models for key 2, etc. A key that is
+     *      rate-limited or out of credits therefore fails over to the NEXT KEY
+     *      of the same provider before the chain moves on to the next provider.
+     */
     private List<Attempt> buildAttemptChain() {
         List<Attempt> chain = new ArrayList<>();
 
         for (String id : splitCsv(providersRaw)) {
             String baseUrl = env.getProperty("ai." + id + ".base-url", defaultBaseUrl(id));
-            String apiKey = env.getProperty("ai." + id + ".api-key", "");
             String models = env.getProperty("ai." + id + ".models", "");
 
             if (isBlank(models)) {
@@ -322,10 +351,6 @@ public class NvidiaAiService {
                 log.warn("Provider [{}] SKIPPED: no base-url configured and no built-in default", id);
                 continue;
             }
-            if (isBlank(apiKey)) {
-                log.info("Provider [{}] SKIPPED: no API key set (ai.{}.api-key)", id, id);
-                continue;
-            }
 
             List<String> modelList = splitCsv(models);
             if (modelList.isEmpty()) {
@@ -333,16 +358,45 @@ public class NvidiaAiService {
                 continue;
             }
 
-            log.debug("Provider [{}] ENABLED: {} with {} model(s) {}",
-                    id, baseUrl, modelList.size(), modelList);
+            List<String> apiKeys = resolveApiKeys(id);
+            if (apiKeys.isEmpty()) {
+                log.info("Provider [{}] SKIPPED: no API key(s) set (ai.{}.api-key or ai.{}.api-keys)",
+                        id, id, id);
+                continue;
+            }
 
-            Provider provider = new Provider(id, stripTrailingSlash(baseUrl), apiKey, modelList);
-            for (String m : modelList) {
-                chain.add(new Attempt(provider, m));
+            log.debug("Provider [{}] ENABLED: {} with {} key(s), {} model(s) {}",
+                    id, baseUrl, apiKeys.size(), modelList.size(), modelList);
+
+            boolean multiKey = apiKeys.size() > 1;
+            for (int k = 0; k < apiKeys.size(); k++) {
+                String key = apiKeys.get(k);
+                String providerId = multiKey ? id + "-key" + (k + 1) : id;
+                Provider provider = new Provider(providerId, stripTrailingSlash(baseUrl), key, modelList);
+                for (String m : modelList) {
+                    chain.add(new Attempt(provider, m));
+                }
             }
         }
 
         return chain;
+    }
+
+    /**
+     * Resolves the ordered list of API keys for a provider id.
+     * Prefers ai.<id>.api-keys (comma-separated list, dedup'd, blanks dropped).
+     * Falls back to the single ai.<id>.api-key property when api-keys is unset.
+     */
+    private List<String> resolveApiKeys(String id) {
+        List<String> apiKeys = splitCsv(env.getProperty("ai." + id + ".api-keys", ""));
+        if (!apiKeys.isEmpty()) {
+            return apiKeys;
+        }
+        String singleKey = env.getProperty("ai." + id + ".api-key", "");
+        if (!isBlank(singleKey)) {
+            return List.of(singleKey);
+        }
+        return List.of();
     }
 
     private String defaultBaseUrl(String id) {
@@ -589,7 +643,9 @@ public class NvidiaAiService {
             case 400 -> " | Hint: Gemini returns 400 for a malformed request or an unsupported/retired " +
                     "model id - double check ai.gemini.models against the live catalog.";
             case 401 -> " | Hint: API key invalid, wrong header, or missing the right scope.";
-            case 402 -> " | Hint: billing/credits required - this model id is no longer on the free tier.";
+            case 402 -> " | Hint: billing/credits required - this model id is no longer on the free tier, " +
+                    "or this key has depleted its included credits. If you configured multiple keys via " +
+                    "ai.<provider>.api-keys, the next key in the list will be tried automatically.";
             case 403 -> " | Hint: Gemini - key not enabled for the Generative Language API, or a Pro " +
                     "model was requested on a free-tier key. Cerebras - gated/dedicated-endpoint model.";
             case 404 -> " | Hint: model id not found or retired. Verify it in the provider's catalog.";
@@ -597,7 +653,9 @@ public class NvidiaAiService {
             case 422 -> " | Hint: model likely does not accept image input (not a VLM). On Cerebras, " +
                     "only gemma-4-31b currently supports images.";
             case 429 -> " | Hint: rate limited. Gemini free tier is capped at a handful of requests/min; " +
-                    "Cerebras free tier is similarly limited. Back off or let the other provider take over.";
+                    "Cerebras free tier is similarly limited. If multiple keys are configured via " +
+                    "ai.<provider>.api-keys, the next key will be tried automatically; otherwise the next " +
+                    "provider in the chain takes over.";
             case 503 -> " | Hint: model cold-starting or provider unavailable; retry shortly.";
             default -> "";
         };
