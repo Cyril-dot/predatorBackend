@@ -41,10 +41,12 @@ import java.util.stream.Stream;
  *
  * Despite the class name (kept so existing injection points don't change), this
  * is no longer NVIDIA-only. It walks a chain of PROVIDERS, each with its own
- * model list:
+ * model list. The default chain starts with NVIDIA's vision endpoint and can
+ * fall back to other configured providers:
  *
- *   gemini     https://generativelanguage.googleapis.com/v1beta/openai   <- primary, free-tier models
- *   cerebras   https://api.cerebras.ai/v1                                <- fallback
+ *   nvidia     https://integrate.api.nvidia.com/v1                       <- primary vision models
+ *   gemini     https://generativelanguage.googleapis.com/v1beta/openai   <- optional fallback
+ *   cerebras   https://api.cerebras.ai/v1                                <- optional fallback
  *
  * GEMINI NOTE: Google's Gemini API exposes an OpenAI-compatible endpoint at
  * /v1beta/openai/chat/completions. As of the free tier rules in effect since
@@ -99,8 +101,8 @@ public class NvidiaAiService {
 
     // ---- provider chain -------------------------------------------------
 
-    /** Ordered, comma-separated provider ids to try. Gemini first, Cerebras as fallback. */
-    @Value("${ai.providers:gemini,cerebras}")
+    /** Ordered, comma-separated provider ids to try. NVIDIA is the default vision provider. */
+    @Value("${ai.providers:nvidia,gemini,cerebras}")
     private String providersRaw;
 
     /**
@@ -197,8 +199,9 @@ public class NvidiaAiService {
                 log.error("No usable provider. Configured chain=[{}] but none had an API key.", providersRaw);
                 throw new ApiException(
                         "AI scanning is not configured: no provider in [" + providersRaw +
-                                "] has an API key set. Set ai.gemini.api-key / ai.gemini.api-keys (Gemini, " +
-                                "primary) or ai.cerebras.api-key / ai.cerebras.api-keys (Cerebras, fallback).",
+                                "] has an API key set. Configure the provider-specific " +
+                                "ai.<provider>.api-key or ai.<provider>.api-keys property, starting with " +
+                                "NVIDIA_API_KEY for NVIDIA.",
                         HttpStatus.SERVICE_UNAVAILABLE);
             }
 
@@ -320,7 +323,7 @@ public class NvidiaAiService {
     /**
      * Builds the full ordered list of attempts.
      *
-     * For each provider id in ai.providers (default "gemini,cerebras"):
+     * For each provider id in ai.providers (default "nvidia,gemini,cerebras"):
      *   1. Resolve its base URL and model list (falling back to the built-in
      *      defaults in defaultBaseUrl()/defaultModels() if not configured).
      *   2. Resolve its API key(s):
@@ -401,6 +404,7 @@ public class NvidiaAiService {
 
     private String defaultBaseUrl(String id) {
         return switch (id) {
+            case "nvidia" -> "https://integrate.api.nvidia.com/v1";
             case "gemini" -> "https://generativelanguage.googleapis.com/v1beta/openai";
             case "cerebras" -> "https://api.cerebras.ai/v1";
             default -> null;
@@ -418,6 +422,9 @@ public class NvidiaAiService {
      */
     private String defaultModels(String id) {
         return switch (id) {
+            case "nvidia" -> String.join(",",
+                    "meta/llama-3.2-90b-vision-instruct",
+                    "meta/llama-3.2-11b-vision-instruct");
             // Free-tier (Flash-class) Gemini models only - Pro models have been
             // paid-only since 2026-04-01 and will 402/permission-error here.
             case "gemini" -> String.join(",",
@@ -640,8 +647,8 @@ public class NvidiaAiService {
     /** Turns common HTTP codes into an actionable hint appended to the error. */
     private String explainStatus(int status) {
         return switch (status) {
-            case 400 -> " | Hint: Gemini returns 400 for a malformed request or an unsupported/retired " +
-                    "model id - double check ai.gemini.models against the live catalog.";
+            case 400 -> " | Hint: NVIDIA/Gemini returns 400 for a malformed request or an unsupported/retired " +
+                    "model id - double check ai.nvidia.models and ai.gemini.models against the live catalog.";
             case 401 -> " | Hint: API key invalid, wrong header, or missing the right scope.";
             case 402 -> " | Hint: billing/credits required - this model id is no longer on the free tier, " +
                     "or this key has depleted its included credits. If you configured multiple keys via " +
@@ -652,8 +659,8 @@ public class NvidiaAiService {
             case 413 -> " | Hint: payload too large - lower ai.image.max-edge-px.";
             case 422 -> " | Hint: model likely does not accept image input (not a VLM). On Cerebras, " +
                     "only gemma-4-31b currently supports images.";
-            case 429 -> " | Hint: rate limited. Gemini free tier is capped at a handful of requests/min; " +
-                    "Cerebras free tier is similarly limited. If multiple keys are configured via " +
+            case 429 -> " | Hint: rate limited. NVIDIA free tier is capped per minute; Gemini and Cerebras " +
+                    "free tiers are similarly limited. If multiple keys are configured via " +
                     "ai.<provider>.api-keys, the next key will be tried automatically; otherwise the next " +
                     "provider in the chain takes over.";
             case 503 -> " | Hint: model cold-starting or provider unavailable; retry shortly.";
