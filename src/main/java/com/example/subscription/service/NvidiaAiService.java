@@ -44,9 +44,17 @@ import java.util.stream.Stream;
  * list. The default chain prioritizes general multimodal models and can fall
  * back to a specialist vision model only at the end:
  *
- *   openrouter https://openrouter.ai/api/v1                       <- primary free multimodal models
- *   nvidia     https://integrate.api.nvidia.com/v1                <- secondary multimodal models
- *   huggingface https://router.huggingface.co/v1                  <- optional last-resort VLM
+ *   groq        https://api.groq.com/openai/v1                    <- PRIMARY: fast, free, vision-capable
+ *   openrouter  https://openrouter.ai/api/v1                       <- secondary free multimodal models
+ *   nvidia      https://integrate.api.nvidia.com/v1                <- tertiary multimodal models
+ *   huggingface https://router.huggingface.co/v1                   <- optional last-resort VLM
+ *
+ * GROQ NOTE: Groq's LPU inference is significantly faster than GPU-based providers.
+ * Vision is supported via llama-3.2-90b-vision-instruct and llama-3.2-11b-vision-instruct
+ * on the free tier (30 RPM, no credit card required). Get a key at
+ * https://console.groq.com and set ai.groq.api-key (or GROQ_API_KEY if you wire
+ * that into the property). Multiple keys are supported via ai.groq.api-keys
+ * (comma-separated), same pattern as Gemini.
  *
  * GEMINI NOTE: Google's Gemini API exposes an OpenAI-compatible endpoint at
  * /v1beta/openai/chat/completions. As of the free tier rules in effect since
@@ -76,8 +84,8 @@ import java.util.stream.Stream;
  * for multiple Cerebras keys, same pattern as Gemini).
  *
  * Providers whose API key(s) are blank are SKIPPED, so you can deploy with only
- * one of the two keys set (though both is recommended so Cerebras can cover
- * Gemini outages/rate limits and vice versa).
+ * one of the keys set (though having multiple is recommended so providers can
+ * cover each other's outages/rate limits).
  *
  * LOGGING: every scan gets a short trace id (MDC key "scanId") that prefixes all
  * log lines for that request, so concurrent scans stay untangled in the log file.
@@ -101,8 +109,12 @@ public class NvidiaAiService {
 
     // ---- provider chain -------------------------------------------------
 
-    /** Ordered, comma-separated provider ids to try. */
-    @Value("${ai.providers:openrouter,nvidia,huggingface}")
+    /**
+     * Ordered, comma-separated provider ids to try.
+     * Groq is first because it is the fastest (LPU) and has a generous free tier
+     * with native vision support via llama-3.2-90b-vision-instruct.
+     */
+    @Value("${ai.providers:groq,openrouter,nvidia,huggingface}")
     private String providersRaw;
 
     /**
@@ -201,7 +213,7 @@ public class NvidiaAiService {
                         "AI scanning is not configured: no provider in [" + providersRaw +
                                 "] has an API key set. Configure the provider-specific " +
                                 "ai.<provider>.api-key or ai.<provider>.api-keys property, starting with " +
-                                "NVIDIA_API_KEY for NVIDIA.",
+                                "GROQ_API_KEY for Groq (fastest free tier, get one at console.groq.com/keys).",
                         HttpStatus.SERVICE_UNAVAILABLE);
             }
 
@@ -323,7 +335,7 @@ public class NvidiaAiService {
     /**
      * Builds the full ordered list of attempts.
      *
-     * For each provider id in ai.providers (default "openrouter,nvidia,huggingface"):
+     * For each provider id in ai.providers (default "groq,openrouter,nvidia,huggingface"):
      *   1. Resolve its base URL and model list (falling back to the built-in
      *      defaults in defaultBaseUrl()/defaultModels() if not configured).
      *   2. Resolve its API key(s):
@@ -404,12 +416,13 @@ public class NvidiaAiService {
 
     private String defaultBaseUrl(String id) {
         return switch (id) {
-            case "openrouter" -> "https://openrouter.ai/api/v1";
-            case "nvidia" -> "https://integrate.api.nvidia.com/v1";
+            case "groq"        -> "https://api.groq.com/openai/v1";
+            case "openrouter"  -> "https://openrouter.ai/api/v1";
+            case "nvidia"      -> "https://integrate.api.nvidia.com/v1";
             case "huggingface" -> "https://router.huggingface.co/v1";
-            case "gemini" -> "https://generativelanguage.googleapis.com/v1beta/openai";
-            case "cerebras" -> "https://api.cerebras.ai/v1";
-            default -> null;
+            case "gemini"      -> "https://generativelanguage.googleapis.com/v1beta/openai";
+            case "cerebras"    -> "https://api.cerebras.ai/v1";
+            default            -> null;
         };
     }
 
@@ -417,14 +430,24 @@ public class NvidiaAiService {
      * Multimodal-capable defaults. The final model for the primary providers is
      * intentionally a specialist vision fallback, while Hugging Face is optional.
      *
-     * VERIFY these against the provider's live catalog before deploying - model
-     * ids and free-tier eligibility change, and a retired id returns a 404 that
-     * looks like an outage. In particular: gemini-2.5-flash and
+     * GROQ: llama-3.2-90b-vision-instruct is the primary free vision model (fast,
+     * high quality). llama-3.2-11b-vision-instruct is the lighter fallback on the
+     * same free tier. Both support base64 image input. Free tier: 30 RPM.
+     * Get a key at: https://console.groq.com/keys
+     *
+     * VERIFY all model ids against the provider's live catalog before deploying -
+     * model ids and free-tier eligibility change, and a retired id returns a 404
+     * that looks like an outage. In particular: gemini-2.5-flash and
      * gemini-2.5-flash-lite are slated to shut down 2026-10-16 - after that,
      * ai.gemini.models should drop to just gemini-3-flash,gemini-3.1-flash-lite.
      */
     private String defaultModels(String id) {
         return switch (id) {
+            // Groq: fastest inference (LPU), free tier, native vision support.
+            // 90B is higher quality; 11B is the lighter fallback on the same key.
+            case "groq" -> String.join(",",
+                    "llama-3.2-90b-vision-instruct",
+                    "llama-3.2-11b-vision-instruct");
             case "openrouter" -> String.join(",",
                     "minimax/minimax-m3:free",
                     "google/gemma-4-31b-it:free",
@@ -656,22 +679,27 @@ public class NvidiaAiService {
     /** Turns common HTTP codes into an actionable hint appended to the error. */
     private String explainStatus(int status) {
         return switch (status) {
-            case 400 -> " | Hint: NVIDIA/Gemini returns 400 for a malformed request or an unsupported/retired " +
-                    "model id - double check ai.nvidia.models and ai.gemini.models against the live catalog.";
-            case 401 -> " | Hint: API key invalid, wrong header, or missing the right scope.";
+            case 400 -> " | Hint: Returns 400 for a malformed request or an unsupported/retired model id - " +
+                    "double check ai.<provider>.models against the live catalog. " +
+                    "Groq: verify model ids at console.groq.com/docs/models.";
+            case 401 -> " | Hint: API key invalid, wrong header, or missing the right scope. " +
+                    "Groq keys are generated at console.groq.com/keys.";
             case 402 -> " | Hint: billing/credits required - this model id is no longer on the free tier, " +
                     "or this key has depleted its included credits. If you configured multiple keys via " +
                     "ai.<provider>.api-keys, the next key in the list will be tried automatically.";
             case 403 -> " | Hint: Gemini - key not enabled for the Generative Language API, or a Pro " +
-                    "model was requested on a free-tier key. Cerebras - gated/dedicated-endpoint model.";
-            case 404 -> " | Hint: model id not found or retired. Verify it in the provider's catalog.";
+                    "model was requested on a free-tier key. Cerebras - gated/dedicated-endpoint model. " +
+                    "Groq - account may need verification for higher-capacity models.";
+            case 404 -> " | Hint: model id not found or retired. Verify it in the provider's catalog. " +
+                    "Groq model list: console.groq.com/docs/models.";
             case 413 -> " | Hint: payload too large - lower ai.image.max-edge-px.";
             case 422 -> " | Hint: model likely does not accept image input (not a VLM). On Cerebras, " +
-                    "only gemma-4-31b currently supports images.";
-            case 429 -> " | Hint: rate limited. NVIDIA free tier is capped per minute; Gemini and Cerebras " +
-                    "free tiers are similarly limited. If multiple keys are configured via " +
-                    "ai.<provider>.api-keys, the next key will be tried automatically; otherwise the next " +
-                    "provider in the chain takes over.";
+                    "only gemma-4-31b currently supports images. On Groq, use llama-3.2-90b-vision-instruct " +
+                    "or llama-3.2-11b-vision-instruct.";
+            case 429 -> " | Hint: rate limited. Groq free tier is capped at 30 RPM; NVIDIA free tier is " +
+                    "capped per minute; Gemini and Cerebras free tiers are similarly limited. " +
+                    "If multiple keys are configured via ai.<provider>.api-keys, the next key will be " +
+                    "tried automatically; otherwise the next provider in the chain takes over.";
             case 503 -> " | Hint: model cold-starting or provider unavailable; retry shortly.";
             default -> "";
         };
