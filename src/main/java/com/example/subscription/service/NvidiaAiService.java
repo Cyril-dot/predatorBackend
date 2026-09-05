@@ -44,44 +44,85 @@ import java.util.stream.Stream;
  * list. The default chain prioritizes general multimodal models and can fall
  * back to a specialist vision model only at the end:
  *
- *   groq        https://api.groq.com/openai/v1                    <- PRIMARY: fast, free, vision-capable
+ *   groq        https://api.groq.com/openai/v1                    <- PRIMARY: fastest inference, but only ONE free vision model right now
  *   openrouter  https://openrouter.ai/api/v1                       <- secondary free multimodal models
- *   nvidia      https://integrate.api.nvidia.com/v1                <- tertiary multimodal models
+ *   nvidia      https://integrate.api.nvidia.com/v1                <- tertiary multimodal models (build.nvidia.com)
  *   huggingface https://router.huggingface.co/v1                   <- optional last-resort VLM
  *
- * GROQ NOTE: Groq's LPU inference is significantly faster than GPU-based providers.
- * Vision is supported via llama-3.2-90b-vision-instruct and llama-3.2-11b-vision-instruct
- * on the free tier (30 RPM, no credit card required). Get a key at
- * https://console.groq.com and set ai.groq.api-key (or GROQ_API_KEY if you wire
- * that into the property). Multiple keys are supported via ai.groq.api-keys
- * (comma-separated), same pattern as Gemini.
+ * ============================================================================
+ * MODEL CATALOG LAST VERIFIED: 2026-09-05. This is the single fastest-moving
+ * part of this class. Free-tier vision model rosters on every provider below
+ * change on the order of weeks, not months - model ids get deprecated, preview
+ * models get promoted or killed, and "free" models get moved behind a paywall
+ * with zero notice. ALWAYS check the live catalog before trusting this list:
+ *   - Groq:        console.groq.com/docs/models  (also console.groq.com/docs/deprecations)
+ *   - OpenRouter:  openrouter.ai/collections/free-models (filter for vision/image input)
+ *   - NVIDIA:      build.nvidia.com/search?label=VLM
+ *   - HuggingFace: huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending
+ *   - Gemini:      ai.google.dev/gemini-api/docs/models (check the changelog for shutdown dates)
+ * ============================================================================
+ *
+ * GROQ NOTE: Groq deprecated its llama-3.2-*-vision-* models AND
+ * meta-llama/llama-4-scout-17b-16e-instruct in 2026 (see the deprecations page
+ * above for exact dates). As of this writing, Groq's only vision-capable chat
+ * model is qwen/qwen3.6-27b, and it is served as a PREVIEW model - Groq's own
+ * docs say preview models "are intended for evaluation, not production" and
+ * "may be discontinued at short notice." Treat Groq as a speed-optimized
+ * opportunistic first attempt, not a guaranteed vision provider; the chain
+ * falling through to OpenRouter/NVIDIA is expected, not a bug. Free tier: 30
+ * RPM, no credit card required. Get a key at https://console.groq.com/keys.
+ * Multiple keys are supported via ai.groq.api-keys (comma-separated).
+ *
+ * OPENROUTER NOTE: model ids below are pulled from OpenRouter's official
+ * "Free AI Models" collection (openrouter.ai/collections/free-models) as of
+ * 2026-09-05, filtered to entries whose description explicitly mentions image
+ * input. minimax/minimax-m3:free and the nvidia/thinkingmachines entries are
+ * genuinely multimodal (text+image, some also video/audio); a lot of the OTHER
+ * free models on that page (Nemotron Ultra, the Laguna/Ling/GLM family, LFM2.5)
+ * are TEXT-ONLY despite being strong models generally - don't add them here
+ * without checking the modality tag first, they'll 422 on an image payload.
+ *
+ * NVIDIA NOTE (build.nvidia.com): nemotron-nano-12b-v2-vl and
+ * nemotron-3-nano-omni-30b-a3b-reasoning are NVIDIA's current general-purpose
+ * VLMs (confirmed on build.nvidia.com/search?label=VLM). Also listed:
+ * llama-3.1-nemotron-nano-vl-8b-v1, a smaller doc/OCR-oriented VLM that's a
+ * reasonable last-in-list fallback for a betting-slip (i.e. document-like)
+ * image. qwen3.5-397b-a17b is a large Qwen VLM also hosted here if you want a
+ * bigger fallback model. NVIDIA's build platform issues free API credits on
+ * signup (historically ~1000, expandable on request) rather than a flat
+ * "free forever" tier for every model - verify current credit/rate-limit
+ * terms for whichever key you provision.
  *
  * GEMINI NOTE: Google's Gemini API exposes an OpenAI-compatible endpoint at
- * /v1beta/openai/chat/completions. As of the free tier rules in effect since
- * April 1 2026, only Flash-class models are free (Pro models are paid-only),
- * so the default model list below sticks to Flash / Flash-Lite. Get a key at
- * https://aistudio.google.com/apikey and set ai.gemini.api-key (or GEMINI_API_KEY
- * if you wire that into the property). NOTE: gemini-2.5-flash and
- * gemini-2.5-flash-lite are scheduled to shut down on 2026-10-16 - when that
- * date passes, drop them from ai.gemini.models (or this will start failing with
- * HTTP 404) and lean on gemini-3-flash / gemini-3.1-flash-lite instead.
+ * /v1beta/openai/chat/completions. gemini-2.5-flash and gemini-2.5-flash-lite
+ * are still live and free-tier eligible but are SCHEDULED TO SHUT DOWN ON
+ * 2026-10-16 - after that date, drop them from ai.gemini.models (they'll start
+ * 404ing) and rely on gemini-3.5-flash (GA since 2026-05-19, Google's current
+ * flagship Flash model) and gemini-3.1-flash-lite (stable since 2026-05-07) instead.
+ * gemini-3-flash-preview is also usable today but is a preview id with no
+ * committed shutdown date, so it can move without warning. Get a key at
+ * https://aistudio.google.com/apikey and set ai.gemini.api-key (or
+ * ai.gemini.api-keys for multiple).
  *
- * GEMINI MULTI-KEY NOTE: you can now supply MULTIPLE Gemini API keys via
+ * GEMINI MULTI-KEY NOTE: you can supply MULTIPLE Gemini API keys via
  * ai.gemini.api-keys=key1,key2,key3 (comma-separated). Each key is expanded
  * into its own Provider in the attempt chain, in the order given, each trying
  * every model in ai.gemini.models before moving to the next key. This means a
  * key that is rate-limited (429) or out of free-tier credits (402) fails over
- * to the next Gemini key BEFORE the chain ever falls through to Cerebras.
- * ai.gemini.api-key (singular) still works as a one-key shorthand and is used
- * only if ai.gemini.api-keys is not set. The same ai.<id>.api-keys pattern
- * works for any provider, not just gemini.
+ * to the next Gemini key BEFORE the chain ever falls through to the next
+ * provider. ai.gemini.api-key (singular) still works as a one-key shorthand
+ * and is used only if ai.gemini.api-keys is not set. The same ai.<id>.api-keys
+ * pattern works for any provider, not just gemini.
  *
- * CEREBRAS NOTE: Cerebras Inference is an OpenAI-compatible endpoint too, but
- * vision (image input) is currently only supported by gemma-4-31b - it is the
- * only model in the default list. Free-tier accounts are capped at 2 images per
- * request, which is fine here since we only ever send one. Get a key at
- * https://cloud.cerebras.ai and set ai.cerebras.api-key (or ai.cerebras.api-keys
- * for multiple Cerebras keys, same pattern as Gemini).
+ * CEREBRAS NOTE - REMOVED FROM DEFAULT CHAIN: as of this writing there is no
+ * confirmed vision-capable model on Cerebras's free tier (their listed free
+ * models are Llama 3.3 70B, Llama 4 Scout, and DeepSeek R1, which are text-only
+ * chat models). The previous default of "gemma-4-31b" could not be verified
+ * against Cerebras's current catalog, so it has been removed rather than ship
+ * an id that may 404. The provider plumbing (ai.cerebras.*) is left in place -
+ * if Cerebras ships a confirmed vision model, add it to ai.providers and set
+ * ai.cerebras.models yourself once you've verified the id at
+ * https://inference-docs.cerebras.ai/models.
  *
  * Providers whose API key(s) are blank are SKIPPED, so you can deploy with only
  * one of the keys set (though having multiple is recommended so providers can
@@ -111,8 +152,9 @@ public class NvidiaAiService {
 
     /**
      * Ordered, comma-separated provider ids to try.
-     * Groq is first because it is the fastest (LPU) and has a generous free tier
-     * with native vision support via llama-3.2-90b-vision-instruct.
+     * Groq is first because it is the fastest (LPU), even though it currently
+     * has only one (preview) vision model - a quick win when it works, with
+     * OpenRouter/NVIDIA/HuggingFace as the real depth behind it.
      */
     @Value("${ai.providers:groq,openrouter,nvidia,huggingface}")
     private String providersRaw;
@@ -427,46 +469,73 @@ public class NvidiaAiService {
     }
 
     /**
-     * Multimodal-capable defaults. The final model for the primary providers is
-     * intentionally a specialist vision fallback, while Hugging Face is optional.
+     * Multimodal-capable defaults, last verified 2026-09-05 (see the class
+     * javadoc for links to check each provider's live catalog before trusting
+     * this - free vision rosters change fast and a retired id returns a 404
+     * that looks like an outage).
      *
-     * GROQ: llama-3.2-90b-vision-instruct is the primary free vision model (fast,
-     * high quality). llama-3.2-11b-vision-instruct is the lighter fallback on the
-     * same free tier. Both support base64 image input. Free tier: 30 RPM.
-     * Get a key at: https://console.groq.com/keys
+     * GROQ: qwen/qwen3.6-27b is currently the ONLY vision-capable chat model
+     * Groq serves; it is a preview model, not guaranteed stable. The old
+     * llama-3.2-*-vision-* and llama-4-scout ids are DEPRECATED - do not use.
      *
-     * VERIFY all model ids against the provider's live catalog before deploying -
-     * model ids and free-tier eligibility change, and a retired id returns a 404
-     * that looks like an outage. In particular: gemini-2.5-flash and
-     * gemini-2.5-flash-lite are slated to shut down 2026-10-16 - after that,
-     * ai.gemini.models should drop to just gemini-3-flash,gemini-3.1-flash-lite.
+     * OPENROUTER: every id below is explicitly multimodal (image input) per
+     * OpenRouter's free-models collection. minimax-m3 also takes video;
+     * nemotron-3-nano-omni also takes video+audio; the two "inkling" models
+     * are Thinking Machines' native image+audio multimodal models at two
+     * sizes (41B and 12B active params) so the smaller one is a good final
+     * fallback if the bigger ones are rate-limited.
+     *
+     * NVIDIA (build.nvidia.com): nemotron-nano-12b-v2-vl and
+     * nemotron-3-nano-omni-30b-a3b-reasoning are NVIDIA's general-purpose
+     * VLMs; qwen3.5-397b-a17b is a larger third-party VLM also hosted here;
+     * llama-3.1-nemotron-nano-vl-8b-v1 is smaller and doc/OCR-leaning, which
+     * suits a printed betting slip well as a last-resort fallback.
+     *
+     * HUGGINGFACE: Qwen3-VL-8B-Instruct is the current Qwen vision-language
+     * model on Hugging Face's router; this is the OPTIONAL last-resort model
+     * (only used if ai.huggingface.api-key / HF token is set).
+     *
+     * GEMINI (optional, kept for backwards compatibility): gemini-3.5-flash
+     * is Google's current flagship free-tier-eligible Flash model (GA since
+     * 2026-05-19); gemini-3.1-flash-lite is the stable lighter option;
+     * gemini-3-flash-preview is usable but a preview id with no committed
+     * shutdown date. gemini-2.5-flash / gemini-2.5-flash-lite are kept as
+     * legacy fallbacks but are SCHEDULED TO SHUT DOWN 2026-10-16 - remove
+     * them from ai.gemini.models once that date passes.
+     *
+     * CEREBRAS: no default models - see the CEREBRAS NOTE in the class
+     * javadoc for why this provider currently has nothing to offer here.
      */
     private String defaultModels(String id) {
         return switch (id) {
-            // Groq: fastest inference (LPU), free tier, native vision support.
-            // 90B is higher quality; 11B is the lighter fallback on the same key.
-            case "groq" -> String.join(",",
-                    "llama-3.2-90b-vision-instruct",
-                    "llama-3.2-11b-vision-instruct");
+            // Groq: fastest inference (LPU). Only one vision-capable model
+            // right now, and it's a preview - expect this attempt to
+            // sometimes fail over to the next provider, that's by design.
+            case "groq" -> "qwen/qwen3.6-27b";
             case "openrouter" -> String.join(",",
                     "minimax/minimax-m3:free",
-                    "google/gemma-4-31b-it:free",
-                    "google/gemma-4-26b-a4b-it:free",
-                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free");
+                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                    "thinkingmachines/inkling:free",
+                    "thinkingmachines/inkling-small:free");
             case "nvidia" -> String.join(",",
-                    "minimaxai/minimax-m3",
-                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
                     "nvidia/nemotron-nano-12b-v2-vl",
-                    "meta/llama-3.2-90b-vision-instruct");
+                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                    "qwen/qwen3.5-397b-a17b",
+                    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1");
             // Optional last-resort HF vision model; only used if HF_TOKEN is set.
-            case "huggingface" -> "Qwen/Qwen2.5-VL-7B-Instruct";
-            // Optional providers retained for backwards compatibility.
+            case "huggingface" -> "Qwen/Qwen3-VL-8B-Instruct";
+            // Optional provider retained for backwards compatibility.
             case "gemini" -> String.join(",",
+                    "gemini-3.5-flash",
+                    "gemini-3.1-flash-lite",
+                    "gemini-3-flash-preview",
                     "gemini-2.5-flash",
-                    "gemini-2.5-flash-lite",
-                    "gemini-3-flash",
-                    "gemini-3.1-flash-lite");
-            case "cerebras" -> "gemma-4-31b";
+                    "gemini-2.5-flash-lite");
+            // No confirmed vision-capable model on Cerebras's free tier as of
+            // 2026-09-05 - see the CEREBRAS NOTE above. Left empty on purpose;
+            // buildAttemptChain() will SKIP this provider with a log line
+            // rather than send a request to a guessed model id.
+            case "cerebras" -> "";
             default -> "";
         };
     }
@@ -623,8 +692,8 @@ public class NvidiaAiService {
             log.info("[{}] usage: prompt={} completion={} total={}",
                     attempt.label(), nz(ar.promptTokens), nz(ar.completionTokens),
                     nz(asInt(usage.get("total_tokens"))));
-            // Cerebras (gemma-4-31b) reports image tokens separately - useful to
-            // see how much of the prompt budget the image itself consumed.
+            // Some providers (e.g. Gemini) report image tokens separately -
+            // useful to see how much of the prompt budget the image consumed.
             Object imageTokens = usage.get("image_tokens");
             if (imageTokens != null) {
                 log.info("[{}] image_tokens={}", attempt.label(), imageTokens);
@@ -681,25 +750,26 @@ public class NvidiaAiService {
         return switch (status) {
             case 400 -> " | Hint: Returns 400 for a malformed request or an unsupported/retired model id - " +
                     "double check ai.<provider>.models against the live catalog. " +
-                    "Groq: verify model ids at console.groq.com/docs/models.";
+                    "Groq: verify model ids at console.groq.com/docs/models (llama-3.2-vision and " +
+                    "llama-4-scout are RETIRED there - use qwen/qwen3.6-27b).";
             case 401 -> " | Hint: API key invalid, wrong header, or missing the right scope. " +
                     "Groq keys are generated at console.groq.com/keys.";
             case 402 -> " | Hint: billing/credits required - this model id is no longer on the free tier, " +
                     "or this key has depleted its included credits. If you configured multiple keys via " +
                     "ai.<provider>.api-keys, the next key in the list will be tried automatically.";
             case 403 -> " | Hint: Gemini - key not enabled for the Generative Language API, or a Pro " +
-                    "model was requested on a free-tier key. Cerebras - gated/dedicated-endpoint model. " +
-                    "Groq - account may need verification for higher-capacity models.";
-            case 404 -> " | Hint: model id not found or retired. Verify it in the provider's catalog. " +
-                    "Groq model list: console.groq.com/docs/models.";
+                    "model was requested on a free-tier key. NVIDIA - model may require additional " +
+                    "credits/approval on build.nvidia.com. Groq - account may need verification.";
+            case 404 -> " | Hint: model id not found or retired. Verify it in the provider's catalog - " +
+                    "see the MODEL CATALOG note in this class's javadoc for the right URL per provider.";
             case 413 -> " | Hint: payload too large - lower ai.image.max-edge-px.";
-            case 422 -> " | Hint: model likely does not accept image input (not a VLM). On Cerebras, " +
-                    "only gemma-4-31b currently supports images. On Groq, use llama-3.2-90b-vision-instruct " +
-                    "or llama-3.2-11b-vision-instruct.";
-            case 429 -> " | Hint: rate limited. Groq free tier is capped at 30 RPM; NVIDIA free tier is " +
-                    "capped per minute; Gemini and Cerebras free tiers are similarly limited. " +
-                    "If multiple keys are configured via ai.<provider>.api-keys, the next key will be " +
-                    "tried automatically; otherwise the next provider in the chain takes over.";
+            case 422 -> " | Hint: model likely does not accept image input (not a VLM). Double-check the " +
+                    "model's modality tag on the provider's site - several free text-only models (e.g. " +
+                    "OpenRouter's Nemotron Ultra, Laguna, Ling, GLM 5.2 entries) will 422 on an image payload.";
+            case 429 -> " | Hint: rate limited. Groq free tier is capped at 30 RPM; NVIDIA and Gemini free " +
+                    "tiers are similarly limited per minute/day. If multiple keys are configured via " +
+                    "ai.<provider>.api-keys, the next key will be tried automatically; otherwise the next " +
+                    "provider in the chain takes over.";
             case 503 -> " | Hint: model cold-starting or provider unavailable; retry shortly.";
             default -> "";
         };
