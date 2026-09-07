@@ -11,6 +11,7 @@ import com.example.subscription.model.PayoutRecord;
 import com.example.subscription.service.AdminService;
 import com.example.subscription.service.CommissionService;
 import com.example.subscription.service.StatsService;
+import com.example.subscription.util.CommissionQuery;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -57,11 +58,25 @@ public class SuperAdminController {
     }
 
     @GetMapping("/admins")
-    public ApiResponse<Object> listAdmins() {
+    public ApiResponse<Object> listAdmins(@RequestParam(required = false) Integer limit) {
         List<Map<String, Object>> list = adminService.listAll().stream()
                 .map(this::adminSummaryWithStats)
                 .collect(Collectors.toList());
-        return ApiResponse.ok("All admins (" + list.size() + ")", list);
+
+        int pageSize = (limit == null || limit < 1) ? list.size() : Math.min(limit, list.size());
+        List<Map<String, Object>> page = list.subList(0, pageSize);
+
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("page", 1);
+        meta.put("totalPages", 1);
+        meta.put("total", list.size());
+        meta.put("limit", pageSize);
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("items", page);
+        data.put("meta", meta);
+
+        return ApiResponse.ok("All admins", data);
     }
 
     @GetMapping("/admins/{username}")
@@ -146,9 +161,19 @@ public class SuperAdminController {
     }
 
     @GetMapping("/commissions")
-    public ApiResponse<Object> allCommissions() {
+    public ApiResponse<Object> allCommissions(@RequestParam(required = false) String status,
+                                               @RequestParam(required = false) String period,
+                                               @RequestParam(required = false) String admin,
+                                               @RequestParam(required = false) Integer page,
+                                               @RequestParam(required = false) Integer limit) {
         List<CommissionRecord> records = commissionService.listAll();
-        return ApiResponse.ok("All commission records (" + records.size() + ")", records);
+        if (admin != null && !admin.isBlank()) {
+            records = records.stream()
+                    .filter(c -> admin.equalsIgnoreCase(c.getAdminUsername()))
+                    .collect(Collectors.toList());
+        }
+        Map<String, Object> data = CommissionQuery.paginate(records, status, period, page, limit);
+        return ApiResponse.ok("All commission records", data);
     }
 
     // ---------------------------------------------------------------

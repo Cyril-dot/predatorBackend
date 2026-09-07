@@ -9,10 +9,12 @@ import com.example.subscription.model.UserAccount;
 import com.example.subscription.repository.InMemoryUserRepository;
 import com.example.subscription.service.AdminService;
 import com.example.subscription.service.CommissionService;
+import com.example.subscription.util.CommissionQuery;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
@@ -142,10 +144,15 @@ public class AdminController {
 
     /** Every commission this admin has earned, itemized per referred payment. */
     @GetMapping("/commissions")
-    public ApiResponse<Object> commissions(HttpServletRequest request) {
+    public ApiResponse<Object> commissions(HttpServletRequest request,
+                                            @RequestParam(required = false) String status,
+                                            @RequestParam(required = false) String period,
+                                            @RequestParam(required = false) Integer page,
+                                            @RequestParam(required = false) Integer limit) {
         String username = currentSession(request).getUsername();
         List<CommissionRecord> records = commissionService.listForAdmin(username);
-        return ApiResponse.ok("Commission history (" + records.size() + " records)", records);
+        Map<String, Object> data = CommissionQuery.paginate(records, status, period, page, limit);
+        return ApiResponse.ok("Commission history", data);
     }
 
     /** Payout receipts this admin has received from a super admin. */
