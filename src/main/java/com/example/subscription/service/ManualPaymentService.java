@@ -145,7 +145,7 @@ public class ManualPaymentService {
         UserAccount account = accountService.assignSubscription(payment.getEmail(), payment.getPlan());
 
         commissionService.recordIfReferred(
-                "MANUAL_" + payment.getId(), payment.getEmail(), payment.getPlan(),
+                "MANUAL_" + payment.getId(), payment.getEmail(), payment.getPlan().name(),
                 payment.getPlan().getAmountCedis(), account.getReferredByAdminCode());
 
         payment.setStatus(ManualPaymentStatus.APPROVED);

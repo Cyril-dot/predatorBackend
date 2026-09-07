@@ -33,12 +33,18 @@ public class CommissionService {
     }
 
     /**
-     * Called right after a payment is verified as successful. If the paying
-     * user was referred by an admin's referral code (and that admin is still
-     * active), a CommissionRecord is created splitting the payment between
-     * the admin and the platform. No-op if there's no valid referral.
+     * Called right after a payment is verified as successful - whether it's
+     * a time-based plan (2HR/3HR/5HR) or an AI scan purchase (BASIC/
+     * STANDARD/PREMIUM). If the paying user was referred by an admin's
+     * referral code (and that admin is still active), a CommissionRecord is
+     * created splitting the payment between the admin and the platform.
+     * No-op if there's no valid referral.
+     *
+     * @param planLabel a display label for what was purchased, e.g.
+     *                  {@code Plan.THREE_HOUR.name()} or
+     *                  {@code ScanPlan.BASIC.name()}
      */
-    public void recordIfReferred(String paymentReference, String userEmail, Plan plan,
+    public void recordIfReferred(String paymentReference, String userEmail, String planLabel,
                                   int amountCedis, String referralCode) {
         if (referralCode == null || referralCode.isBlank()) {
             return;
@@ -56,7 +62,7 @@ public class CommissionService {
 
         CommissionRecord record = new CommissionRecord(
                 CodeGenerator.generateId(), paymentReference, admin.getUsername(), userEmail,
-                plan, amountCedis, adminShare, platformShare);
+                planLabel, amountCedis, adminShare, platformShare);
 
         commissionRepository.save(record);
     }

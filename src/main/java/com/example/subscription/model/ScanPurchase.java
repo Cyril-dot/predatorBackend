@@ -46,6 +46,13 @@ public class ScanPurchase {
     private String reviewedByAdmin;
     private LocalDateTime usedAt;
 
+    /**
+     * The referral code (if any) attached to this email's account at the
+     * time of submission - captured here so approving the purchase can
+     * record admin commission, same as time-plan payments.
+     */
+    private String referredByAdminCode;
+
     protected ScanPurchase() {
     }
 
@@ -141,5 +148,13 @@ public class ScanPurchase {
 
     public boolean isReadyToScan() {
         return status == ScanPurchaseStatus.APPROVED;
+    }
+
+    public String getReferredByAdminCode() {
+        return referredByAdminCode;
+    }
+
+    public void setReferredByAdminCode(String referredByAdminCode) {
+        this.referredByAdminCode = referredByAdminCode;
     }
 }

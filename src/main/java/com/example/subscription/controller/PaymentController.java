@@ -114,7 +114,7 @@ public class PaymentController {
         UserAccount account = accountService.assignSubscription(tx.getEmail(), tx.getPlan());
 
         commissionService.recordIfReferred(
-                tx.getReference(), tx.getEmail(), tx.getPlan(),
+                tx.getReference(), tx.getEmail(), tx.getPlan().name(),
                 tx.getPlan().getAmountCedis(), account.getReferredByAdminCode());
 
         Map<String, Object> result = new LinkedHashMap<>();

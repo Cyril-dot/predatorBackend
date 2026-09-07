@@ -4,6 +4,7 @@ import com.example.subscription.exception.ApiException;
 import com.example.subscription.model.ScanPlan;
 import com.example.subscription.model.ScanPurchase;
 import com.example.subscription.model.ScanPurchaseStatus;
+import com.example.subscription.model.UserAccount;
 import com.example.subscription.repository.InMemoryScanPurchaseRepository;
 import com.example.subscription.util.CodeGenerator;
 import org.springframework.http.HttpStatus;
@@ -18,14 +19,24 @@ import java.util.List;
  * pays mobile money/bank transfer outside the app and submits proof here for
  * an admin to review. Approving a submission does NOT run the AI scan - it
  * just unlocks a single call to POST /api/scan/analyze for that purchase id.
+ *
+ * Referral commission: if the buyer's account was referred by an admin's
+ * referral code, approving the purchase records a CommissionRecord for that
+ * admin, same as time-plan payments.
  */
 @Service
 public class ScanPurchaseService {
 
     private final InMemoryScanPurchaseRepository scanPurchaseRepository;
+    private final AccountService accountService;
+    private final CommissionService commissionService;
 
-    public ScanPurchaseService(InMemoryScanPurchaseRepository scanPurchaseRepository) {
+    public ScanPurchaseService(InMemoryScanPurchaseRepository scanPurchaseRepository,
+                                AccountService accountService,
+                                CommissionService commissionService) {
         this.scanPurchaseRepository = scanPurchaseRepository;
+        this.accountService = accountService;
+        this.commissionService = commissionService;
     }
 
     /**
@@ -82,6 +93,14 @@ public class ScanPurchaseService {
                 id, email.trim(), scanPlan, accountName.trim(), accountNumber.trim(),
                 networkOrBank.trim(), reference.trim(), trimmedUrl);
 
+        // Carry over the referral code from the buyer's account (if any) so
+        // approving this purchase can credit the referring admin, same as
+        // time-plan payments.
+        UserAccount account = accountService.getAccountOrNull(email.trim());
+        if (account != null) {
+            purchase.setReferredByAdminCode(account.getReferredByAdminCode());
+        }
+
         scanPurchaseRepository.save(purchase);
         return purchase;
     }
@@ -119,6 +138,10 @@ public class ScanPurchaseService {
         purchase.setReviewedAt(LocalDateTime.now());
         purchase.setReviewedByAdmin(adminUsername);
         scanPurchaseRepository.save(purchase);
+
+        commissionService.recordIfReferred(
+                "SCAN_" + purchase.getId(), purchase.getEmail(), purchase.getScanPlan().name(),
+                purchase.getScanPlan().getAmountCedis(), purchase.getReferredByAdminCode());
 
         return purchase;
     }
